@@ -1,0 +1,157 @@
+# -*- mode: ruby -*-
+#
+# Vagrantfile - One development machine to rule them all.
+#
+
+
+require 'json'
+
+
+# Provisioning might need updating for different CentOS releases, see
+# the provision scripts for details. Only CentOS 7 and 8 were tested...
+centos_release = "stream-8"
+
+centos_release_number = centos_release.match(/([0-9]+)$/)[1].to_i
+
+# This is the minimum customization necessary but, to tailor this configuration
+# to a specific project, you should also edit the "vagrant/provision.sh" script...
+vm_name = "CentOS #{centos_release_number}.x"
+vm_hostname = "vagrant-centos-#{centos_release_number}x"
+vm_size = {"cpus" => 1, "memory" => 1024}
+
+# Use a box with included guest additions, to avoid occasional provisioning problems.
+# Possible alternatives are the "bento/centos-#{centos_release}" box, on which this
+# default box is based, or the CentOS project's "centos/#{centos_release}" box...
+vm_box = "carlosefr/centos-#{centos_release}"
+vm_box_version = nil
+
+# Location of the external files used by this script...
+vagrant_assets = File.dirname(__FILE__) + "/vagrant"
+
+DISKSİZE = "16GB"
+PROVIDER = "virtualbox"
+
+# Someone may need to (locally) override the VM size for some specific task...
+vm_size_override = File.dirname(__FILE__) + "/.vagrant_size.json"
+if File.exists?(vm_size_override)
+    vm_size = JSON.parse(File.read(vm_size_override))
+end
+
+
+# This workaround is needed during the brief period when a new CentOS point
+# release becomes available but the CentOS base box hasn't been updated yet.
+# It's also required if we choose to stick with some specific point release.
+begin
+    class FixGuestAdditions < VagrantVbguest::Installers::CentOS
+        def dependencies
+            packages = super
+
+            # If there's no "kernel-devel" package matching the running kernel in the
+            # default repositories, then the base box we're using doesn't match the
+            # latest CentOS release anymore and we have to look for it in the archives...
+            if communicate.test('test -f /etc/centos-release && ! yum -q info kernel-devel-`uname -r` &>/dev/null')
+                env.ui.warn("[#{vm.name}] Looking for the CentOS 'kernel-devel' package in the release archives...")
+                packages.sub!('kernel-devel-`uname -r`', 'http://mirror.centos.org/centos' \
+                                                         '/`grep -Po \'\b\d+\.[\d.]+\b\' /etc/centos-release`' \
+                                                         '/{os,updates}/`arch`/Packages/kernel-devel-`uname -r`.rpm')
+            end
+
+            packages
+        end
+    end
+
+    # Anything with priority over 5 overrides the default installer...
+    VagrantVbguest::Installer.register(FixGuestAdditions, 100)
+rescue NameError
+    # The "VagrantVbguest" class won't be available during the first pass,
+    # when vagrant is checking for required plugins and stuff like that...
+end
+
+
+Vagrant.configure(2) do |config|
+    builtin_guest_additions = vm_box.match(/^(?:carlosefr|bento)/)
+
+    if !builtin_guest_additions
+        config.vagrant.plugins = ["vagrant-vbguest"]
+    end
+
+    config.vm.box = vm_box
+    config.vm.box_version = vm_box_version.nil? ? vm_box_version : ">= 0"
+    config.vm.hostname = vm_hostname
+
+    # The CentOS box defaults to using rsynced folders...
+    config.vm.synced_folder ".", "/vagrant", disabled: true
+
+    # Support git operations inside the VM. The file provisioner requires files to exist,
+    # which in this case is a good thing as it prevents commits attributed to wrong users...
+    config.vm.provision "file", source: "~/.gitconfig", destination: "~/.gitconfig"
+
+    # Make the local user's SSH key reachable by the main provisioning script...
+    #config.vm.provision "file", source: "~/.ssh/id_rsa.pub", destination: "/tmp/id_rsa.pub"
+
+    config.vm.provision 'shell', inline: 'yum -y install openssh-server'
+    config.vm.provision 'shell', inline: 'yum install -y passwd'
+    # Perform base-system customizations and install project-specific dependencies...
+    config.vm.provision "shell", path: "#{vagrant_assets}/provision-v#{centos_release_number >= 8 ? 8 : 7}.sh",
+                                 privileged: false  # ...run as the "vagrant" user.
+
+    config.ssh.forward_agent = true
+    config.ssh.keep_alive = true
+
+    config.vm.network "forwarded_port", guest: 80, host: 8080
+
+    # Create a forwarded port mapping which allows access to a specific port
+    # within the machine from a port on the host machine and only allow access
+    # via 127.0.0.1 to disable public access
+    # config.vm.network "forwarded_port", guest: 80, host: 8080, host_ip: "127.0.0.1"
+  
+    # Create a private network, which allows host-only access to the machine
+    # using a specific IP.
+     config.vm.network "private_network", ip: "192.168.10.10"
+  
+  
+    config.vm.provider PROVIDER do |vm, override|
+        vm.name = vm_name
+        vm.gui = false
+
+        vm.memory = vm_size["memory"]
+        vm.cpus = vm_size["cpus"]
+        vm.default_nic_type = "virtio"
+        override.vm.disk :disk, size: DISKSİZE, name: 'centos_storage'
+
+        #
+        # Resolve names using the host's configured DNS resolvers, but hide their actual IP
+        # addresses from the guest (useful if they come from DHCP and are subject to change).
+        #
+        # It is sometimes useful to use "--natdnshostresolver1" instead, to use the host's
+        # stub resolver APIs (i.e. when using VPN software that hijacks DNS resolution), but
+        # beware that this comes with some caveats (e.g. musl doesn't deal with it very well).
+        #
+        vm.customize ["modifyvm", :id, "--natdnsproxy1", "on"]
+
+        # No need for audio in a server-type VM...
+        vm.customize ["modifyvm", :id, "--audio", "none"]
+
+        # Install guest additions automatically (if not already builtin)...
+        if Vagrant.has_plugin?("vagrant-vbguest")
+            override.vbguest.auto_update = !builtin_guest_additions
+            override.vbguest.allow_downgrade = false
+        end
+
+        # Expose the VM to the host instead of forwarding many ports individually
+        # for complex projects. The provisioning script will setup Avahi/mDNS to
+        # make the guest VM easily accessible through a "*.local" domain...
+        #override.vm.network "private_network", type: "dhcp", name: "vboxnet0"
+
+        # Make the current directory visible (and editable) inside the VM...
+        override.vm.synced_folder ".", "/home/vagrant/shared"
+
+        config.ssh.insert_key = false
+        config.ssh.username="vagrant"
+        config.ssh.password="vagrant"
+        config.vm.provision 'shell', inline: 'echo "vagrant:1234" | chpasswd'
+    end
+end
+
+
+# vim: set expandtab ts=4 sw=4 ft=ruby:

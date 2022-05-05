@@ -1,0 +1,113 @@
+# -*- mode: ruby -*-
+#
+# Vagrantfile - One development machine to rule them all.
+#
+
+
+require 'json'
+
+
+# Provisioning might need updating for different Debian
+# releases, see the "provision.sh" script for details...
+debian_release = 11
+debian_codenames = {8 => "jessie", 9 => "stretch", 10 => "buster", 11 => "bullseye"}  # ...currently supported.
+
+
+# This is the minimum customization necessary but, to tailor this configuration
+# to a specific project, you should also edit the "vagrant/provision.sh" script...
+vm_name = "Generic Debian #{debian_release}.x (#{debian_codenames[debian_release]})"
+vm_hostname = "vagrant-debian-#{debian_codenames[debian_release]}"
+vm_size = {"cpus" => 1, "memory" => 1024}
+
+# Use a box with included guest additions by default, to avoid occasional provisioning problems.
+# Possible alternatives are the "bento/debian-#{debian_release}" box, on which this default box
+# is based, or the Debian project's "debian/contrib-#{debian_codenames[debian_release]}64" box...
+vm_box = "carlosefr/debian-#{debian_release}"
+vm_box_version = nil
+
+# Location of the external files used by this script...
+vagrant_assets = File.dirname(__FILE__) + "/vagrant"
+
+
+# Someone may need to (locally) override the VM size for some specific task...
+vm_size_override = File.dirname(__FILE__) + "/.vagrant_size.json"
+if File.exists?(vm_size_override)
+    vm_size = JSON.parse(File.read(vm_size_override))
+end
+
+# Box metadata location and box name
+DISKSİZE = "16GB"
+PROVIDER = "virtualbox"
+
+Vagrant.configure(2) do |config|
+    builtin_guest_additions = vm_box.match(/^(?:carlosefr|bento|\/|[^\/]+\/contrib-)/)
+
+    if !builtin_guest_additions
+        config.vagrant.plugins = ["vagrant-vbguest"]
+    end
+
+    config.vm.box = vm_box
+    config.vm.box_version = vm_box_version.nil? ? vm_box_version : ">= 0"
+    config.vm.hostname = vm_hostname
+
+    # The Debian box defaults to using an rsynced folder...
+    config.vm.synced_folder ".", "/vagrant", disabled: true
+
+    # Support git operations inside the VM. The file provisioner requires files to exist,
+    # which in this case is a good thing as it prevents commits attributed to wrong users...
+    config.vm.provision "file", source: "~/.gitconfig", destination: "~/.gitconfig"
+
+    # Make the local user's SSH key reachable by the main provisioning script...
+    #config.vm.provision "file", source: "~/.ssh/id_rsa.pub", destination: "/tmp/id_rsa.pub"
+
+    # Perform base-system customizations and install project-specific dependencies...
+    config.vm.provision "shell", path: "#{vagrant_assets}/provision.sh",
+                                 privileged: false  # ...run as the "vagrant" user.
+
+    config.ssh.forward_agent = true
+    config.ssh.keep_alive = true
+
+    config.vm.provider PROVIDER do |vm, override|
+        vm.name = vm_name
+        vm.gui = false
+
+        vm.memory = vm_size["memory"]
+        vm.cpus = vm_size["cpus"]
+        vm.default_nic_type = "virtio"
+        override.vm.disk :disk, size: DISKSİZE, name: 'debian_storage'
+
+        # Install guest additions automatically (if not already builtin)...
+        if Vagrant.has_plugin?("vagrant-vbguest")
+            override.vbguest.auto_update = !builtin_guest_additions
+            override.vbguest.allow_downgrade = false
+        end
+
+        #
+        # Resolve names using the host's configured DNS resolvers, but hide their actual IP
+        # addresses from the guest (useful if they come from DHCP and are subject to change).
+        #
+        # It is sometimes useful to use "--natdnshostresolver1" instead, to use the host's
+        # stub resolver APIs (i.e. when using VPN software that hijacks DNS resolution), but
+        # beware that this comes with some caveats (e.g. musl doesn't deal with it very well).
+        #
+        vm.customize ["modifyvm", :id, "--natdnsproxy1", "on"]
+
+        # No need for audio in a server-type VM...
+        vm.customize ["modifyvm", :id, "--audio", "none"]
+
+        # Expose the VM to the host instead of forwarding many ports individually
+        # for complex projects. The provisioning script will setup Avahi/mDNS to
+        # make the guest VM easily accessible through a "*.local" domain...
+        #override.vm.network "private_network", type: "dhcp", name: "vboxnet0"
+
+        # Make the current directory visible (and editable) inside the VM...
+        override.vm.synced_folder ".", "/home/vagrant/shared"
+        config.ssh.insert_key = false
+        config.ssh.username="vagrant"
+        config.ssh.password="vagrant"
+        config.vm.provision 'shell', inline: 'echo "vagrant:1234" | chpasswd'
+    end
+end
+
+
+# vim: set expandtab ts=4 sw=4 ft=ruby:
